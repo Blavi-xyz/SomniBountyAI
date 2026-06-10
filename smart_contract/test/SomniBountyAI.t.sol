@@ -43,6 +43,7 @@ contract SomniBountyAITest {
     function setUp() public {
         platform = new MockAgentPlatform();
         registry = new VulnerabilityRegistry();
+        _seedRegistry();
         escrow = new SomniBountyAI(
             address(platform),
             address(registry),
@@ -103,7 +104,6 @@ contract SomniBountyAITest {
             bytes32("project"),
             agentWallet
         );
-
     }
 
     function testRegisterProjectIgnoresProvidedPayoutWallet() public {
@@ -135,11 +135,46 @@ contract SomniBountyAITest {
         (uint96 critical, uint96 high, uint96 medium) = escrow.projectBountyTiers(projectId);
         require(job.projectId == projectId, "project mismatch");
         require(uint8(job.status) == uint8(SomniBountyAI.ScanStatus.Pending), "not pending");
+        require(job.latestRequestId == requestId, "latest request mismatch");
         require(critical == CRITICAL && high == HIGH && medium == MEDIUM, "tiers mismatch");
         (, uint256 pendingScanJobId,,,) = escrow.pendingAgentRequests(requestId);
         require(pendingScanJobId == scanJobId, "pending mismatch");
         require(platform.requestFees(requestId) == expectedFee, "fee mismatch");
         require(publisher.balance == publisherBalanceBefore - value, "publisher did not pay");
+    }
+
+    function testRetrySnapshotUsesCallerPaidJsonFeeAndStoresLatestRequest() public {
+        uint256 projectId = _registerProject();
+        uint256 value = escrow.quoteSetupBountyTiers(CRITICAL, HIGH, MEDIUM);
+        vm.prank(publisher);
+        (uint256 scanJobId, uint256 firstRequestId) =
+            escrow.setupBountyTiers{ value: value }(projectId, CRITICAL, HIGH, MEDIUM);
+
+        uint256 retryFee = escrow.requiredJsonApiFee();
+        uint256 reserveBefore = escrow.getScanJob(scanJobId).agentFeeReserve;
+        vm.prank(publisher);
+        uint256 retryRequestId = escrow.retrySnapshot{ value: retryFee }(scanJobId);
+
+        SomniBountyAI.ScanJob memory job = escrow.getScanJob(scanJobId);
+        require(retryRequestId != firstRequestId, "same request");
+        require(job.latestRequestId == retryRequestId, "latest retry mismatch");
+        require(job.agentFeeReserve == reserveBefore, "reserve consumed");
+        (, uint256 pendingScanJobId,,,) = escrow.pendingAgentRequests(retryRequestId);
+        require(pendingScanJobId == scanJobId, "retry pending mismatch");
+        require(platform.requestFees(retryRequestId) == retryFee, "retry fee mismatch");
+    }
+
+    function testRetrySnapshotRejectsUnauthorizedCaller() public {
+        uint256 projectId = _registerProject();
+        uint256 value = escrow.quoteSetupBountyTiers(CRITICAL, HIGH, MEDIUM);
+        vm.prank(publisher);
+        (uint256 scanJobId,) =
+            escrow.setupBountyTiers{ value: value }(projectId, CRITICAL, HIGH, MEDIUM);
+
+        uint256 retryFee = escrow.requiredJsonApiFee();
+        vm.prank(fixer);
+        vm.expectRevert(SomniBountyAI.UnauthorizedSponsor.selector);
+        escrow.retrySnapshot{ value: retryFee }(scanJobId);
     }
 
     function testScanPayloadUsesRealLlmInferStringSelector() public {
@@ -164,6 +199,24 @@ contract SomniBountyAITest {
 
         bytes memory payload = escrow.buildSnapshotPayload(projectId, scanJobId);
         require(bytes4(payload) == IJsonApiAgent.fetchString.selector, "wrong json selector");
+    }
+
+    function testSecondReviewPromptValidatesTxOriginEvidence() public {
+        (, uint256 requestId) = _fundAndRequestScan();
+
+        platform.fulfillString(
+            requestId,
+            ResponseStatus.Success,
+            "file=src/VulnerableVault.sol evidence=require(tx.origin == owner) around withdraw"
+        );
+        platform.fulfillString(2, ResponseStatus.Success, "HIGH");
+
+        bytes memory payload = escrow.buildSecondReviewPayload(1);
+        require(bytes4(payload) == ILLMAgent.inferString.selector, "wrong llm selector");
+        (string memory prompt,,,) =
+            abi.decode(_withoutSelector(payload), (string, string, bool, string[]));
+        require(_contains(prompt, "require(tx.origin == owner)"), "missing tx.origin rule");
+        require(_contains(prompt, "severity could be HIGH instead of CRITICAL"), "missing severity rule");
     }
 
     function testScanCallbackRejectsSpoofedPlatform() public {
@@ -304,6 +357,129 @@ contract SomniBountyAITest {
         );
     }
 
+    function _seedRegistry() internal {
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.Critical,
+            "Reentrancy",
+            "External control flow can re-enter before state is finalized.",
+            "Look for call/value/transfer hooks before balance, debt, share, or nonce updates; comments may mark reentrancy.",
+            "State mutation after external call; missing nonReentrant guard around withdraw/claim/execute.",
+            "Apply checks-effects-interactions, update accounting before calls, add reentrancy guard where needed.",
+            "Funds can be drained or accounting corrupted.",
+            "ipfs://somnibounty/reentrancy"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.Critical,
+            "Access control bypass",
+            "Privileged function can be called by unauthorized account.",
+            "Look for admin setters, mint, withdraw, upgrade, pause, sweep, or config functions missing role checks.",
+            "Sensitive function lacks onlyOwner/role check or validates wrong address.",
+            "Add explicit role/owner authorization and tests for unauthorized callers.",
+            "Attacker can steal funds, mint assets, change config, or disable protocol.",
+            "ipfs://somnibounty/access-control"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.High,
+            "Unchecked external call",
+            "Low-level call result ignored or external call assumes success.",
+            "Look for .call/.delegatecall/.staticcall returns unused, or ERC20 transfer return ignored.",
+            "Function continues after failed external interaction.",
+            "Check success boolean, validate returned data, revert on failed required calls.",
+            "Funds or state can desync silently.",
+            "ipfs://somnibounty/unchecked-call"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.High,
+            "Signature replay",
+            "Signed authorization can be reused across chains, contracts, or nonces.",
+            "Look for ecrecover/permit/meta-tx without nonce, deadline, chainId, or contract domain.",
+            "Hash omits nonce/deadline/domain separator or nonce not consumed before action.",
+            "Use EIP-712 domain, chainId, contract address, deadline, and monotonic nonce.",
+            "Attacker can repeat approvals/orders/claims.",
+            "ipfs://somnibounty/signature-replay"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.Critical,
+            "Oracle manipulation",
+            "Protocol trusts manipulable spot price or stale oracle data.",
+            "Look for DEX spot reads, single block reserves, missing staleness checks, or no bounds.",
+            "Price from AMM reserves or oracle used directly for mint, borrow, redeem, or liquidate.",
+            "Use TWAP, trusted oracle, staleness checks, sanity bounds, and circuit breakers.",
+            "Attacker can drain collateral or manipulate settlement.",
+            "ipfs://somnibounty/oracle-manipulation"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.High,
+            "Price or slippage manipulation",
+            "Swap or valuation accepts attacker-controlled price movement.",
+            "Look for minOut zero, deadline missing, user slippage ignored, or path controlled by caller.",
+            "Function swaps without minimum output or validates against current manipulated reserves.",
+            "Require minOut/deadline, validate route, bound price impact, and use safe router patterns.",
+            "Attacker can sandwich, drain value, or force bad execution.",
+            "ipfs://somnibounty/price-slippage"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.Medium,
+            "Unsafe ERC20 transfer",
+            "Token transfer assumes standard boolean behavior.",
+            "Look for IERC20.transfer/transferFrom not wrapped in SafeERC20.",
+            "Non-standard tokens can return false or no data and break assumptions.",
+            "Use SafeERC20 and validate balance deltas when required.",
+            "Funds can be stuck, unpaid, or accounting can desync.",
+            "ipfs://somnibounty/unsafe-erc20"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.Critical,
+            "Delegatecall or proxy storage collision",
+            "Delegatecall/proxy pattern can overwrite privileged storage.",
+            "Look for delegatecall to user-controlled target, unstructured proxy storage, or changed layout.",
+            "Implementation and proxy storage slots collide, or target not allowlisted.",
+            "Use EIP-1967/UUPS patterns, fixed storage gaps, allowlisted implementations, and upgrade tests.",
+            "Attacker can seize ownership or brick protocol.",
+            "ipfs://somnibounty/proxy-storage"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.High,
+            "tx.origin authentication",
+            "Authorization depends on tx.origin instead of msg.sender.",
+            "Look for require(tx.origin == owner) or mixed origin/sender checks.",
+            "Phishing contract can make victim originate transaction and pass auth.",
+            "Use msg.sender and role checks; never use tx.origin for authorization.",
+            "Victim can be tricked into executing privileged actions.",
+            "ipfs://somnibounty/tx-origin"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.Medium,
+            "Denial of service",
+            "Function can be permanently or cheaply blocked.",
+            "Look for unbounded loops, push payments, external calls inside loops, or griefable state.",
+            "Any failing recipient/caller blocks progress for all users.",
+            "Use pull payments, bounded loops, pagination, and failure isolation.",
+            "Protocol operations can be frozen or made too expensive.",
+            "ipfs://somnibounty/denial-of-service"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.Medium,
+            "Precision or rounding loss",
+            "Math order or rounding direction gives unfair value transfer.",
+            "Look for division before multiplication, inconsistent share math, or down-rounding in mint/redeem.",
+            "Small deposits/withdrawals exploit truncation or accumulate dust.",
+            "Use mulDiv, consistent rounding, minimum amounts, and invariant tests.",
+            "Users or protocol lose value over repeated operations.",
+            "ipfs://somnibounty/precision-loss"
+        );
+        registry.registerTemplate(
+            VulnerabilityRegistry.Category.High,
+            "Upgradeability or admin risk",
+            "Admin/upgrade pathway can bypass security assumptions.",
+            "Look for unprotected initializer, missing disableInitializers, unguarded upgrade, or owner sweep.",
+            "Implementation can be initialized by attacker or upgrade executed without controls.",
+            "Protect initializers, require timelock/multisig/roles, and test upgrade authorization.",
+            "Attacker can upgrade to malicious implementation or steal funds.",
+            "ipfs://somnibounty/admin-risk"
+        );
+    }
+
     function _fundAndRequestScan() internal returns (uint256 projectId, uint256 requestId) {
         projectId = _registerProject();
         uint256 value = escrow.quoteSetupBountyTiers(CRITICAL, HIGH, MEDIUM);
@@ -337,5 +513,31 @@ contract SomniBountyAITest {
             callbackSelector: bytes4(0),
             payload: ""
         });
+    }
+
+    function _withoutSelector(bytes memory payload) internal pure returns (bytes memory result) {
+        result = new bytes(payload.length - 4);
+        for (uint256 i; i < result.length; i++) {
+            result[i] = payload[i + 4];
+        }
+    }
+
+    function _contains(string memory haystack, string memory needle) internal pure returns (bool) {
+        bytes memory haystackBytes = bytes(haystack);
+        bytes memory needleBytes = bytes(needle);
+        if (needleBytes.length == 0 || needleBytes.length > haystackBytes.length) {
+            return false;
+        }
+        for (uint256 i; i <= haystackBytes.length - needleBytes.length; i++) {
+            bool matched = true;
+            for (uint256 j; j < needleBytes.length; j++) {
+                if (haystackBytes[i + j] != needleBytes[j]) {
+                    matched = false;
+                    break;
+                }
+            }
+            if (matched) return true;
+        }
+        return false;
     }
 }

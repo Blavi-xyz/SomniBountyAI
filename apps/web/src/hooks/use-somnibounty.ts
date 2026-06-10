@@ -112,6 +112,7 @@ type ContractScanJob = {
   incidentId: bigint;
   fixId: bigint;
   agentFeeReserve: bigint;
+  latestRequestId: bigint;
   candidateSeverity: number;
   snapshotURI: string;
   resultHash: Hex;
@@ -147,6 +148,12 @@ type ContractFix = {
 const configuredAddress = process.env.NEXT_PUBLIC_SOMNIBOUNTY_ADDRESS;
 const rpcUrl =
   process.env.NEXT_PUBLIC_SOMNIA_RPC_URL ?? "https://api.infra.testnet.somnia.network/";
+
+type RuntimeConfig = {
+  somniaRpcUrl?: string;
+  somniBountyAddress?: string;
+  vulnerabilityRegistryAddress?: string;
+};
 
 function isAddress(value: string | undefined): value is Address {
   return /^0x[a-fA-F0-9]{40}$/.test(value ?? "");
@@ -289,16 +296,20 @@ function statusFromStep(step: string): UiAgentLog["status"] {
 }
 
 export function useSomniBounty(walletClient: WalletClient | null, account: Address | null) {
-  const contractAddress = isAddress(configuredAddress) ? configuredAddress : null;
+  const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfig | null>(null);
+  const activeContractAddress = runtimeConfig?.somniBountyAddress || configuredAddress;
+  const activeRpcUrl = runtimeConfig?.somniaRpcUrl || rpcUrl;
+  const contractAddress = isAddress(activeContractAddress) ? activeContractAddress : null;
   const publicClient = useMemo(
-    () => createPublicClient({ chain: somniaTestnet, transport: http(rpcUrl) }),
-    [],
+    () => createPublicClient({ chain: somniaTestnet, transport: http(activeRpcUrl) }),
+    [activeRpcUrl],
   );
   const [projects, setProjects] = useState<UiProject[]>([]);
   const [scanJobs, setScanJobs] = useState<UiScanJob[]>([]);
   const [incidents, setIncidents] = useState<UiIncident[]>([]);
   const [agentLogs, setAgentLogs] = useState<UiAgentLog[]>([]);
   const [paidBounties, setPaidBounties] = useState<UiPaidBounty[]>([]);
+  const [hasSynced, setHasSynced] = useState(false);
   const [status, setStatus] = useState(
     contractAddress
       ? "Ready to sync live Somnia testnet data"
@@ -306,8 +317,30 @@ export function useSomniBounty(walletClient: WalletClient | null, account: Addre
   );
   const [lastTx, setLastTx] = useState<Hex | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function loadRuntimeConfig() {
+      try {
+        const response = await fetch("/api/config", { cache: "no-store" });
+        if (!response.ok) return;
+        const data = (await response.json()) as RuntimeConfig;
+        if (!cancelled) setRuntimeConfig(data);
+      } catch {
+        // Build-time public env fallback remains available.
+      }
+    }
+
+    void loadRuntimeConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const refresh = useCallback(async () => {
-    if (!contractAddress) return;
+    if (!contractAddress) {
+      setHasSynced(true);
+      return;
+    }
 
     try {
       const [[projectCount, incidentCount, fixCount], scanCount] = await Promise.all([
@@ -490,15 +523,19 @@ export function useSomniBounty(walletClient: WalletClient | null, account: Addre
       setStatus(
         `Synced ${nextProjects.length} project(s), ${nextScanJobs.length} scan job(s), ${nextIncidents.length} incident(s)`,
       );
+      setHasSynced(true);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Unable to sync contract");
+      setHasSynced(true);
     }
   }, [contractAddress, publicClient]);
 
   useEffect(() => {
+    const reset = window.setTimeout(() => setHasSynced(false), 0);
     const initial = window.setTimeout(() => void refresh(), 0);
     const id = window.setInterval(() => void refresh(), 8_000);
     return () => {
+      window.clearTimeout(reset);
       window.clearTimeout(initial);
       window.clearInterval(id);
     };
@@ -584,6 +621,7 @@ export function useSomniBounty(walletClient: WalletClient | null, account: Addre
     agentLogs,
     contractAddress,
     explorerBase: somniaExplorerUrl,
+    hasSynced,
     incidents,
     lastTx,
     paidBounties,

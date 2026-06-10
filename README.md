@@ -1,4 +1,4 @@
-# SomniBounty AI
+﻿# SomniBounty AI
 
 Autonomous security bounty automation for the Somnia Agentathon.
 
@@ -204,7 +204,9 @@ Owns the bounty lifecycle:
 
 Callback invariants:
 
-- only the Somnia Agent platform can call `handleResponse`
+- only the Somnia Agent platform can call typed or raw callback paths
+- live Somnia Agent requests use raw callback selector `0x12345678` and are handled by contract `fallback()`
+- typed `handleResponse(uint256, Response[], ResponseStatus, Request)` remains for interface compatibility and mock tests
 - request ID must exist
 - pending request is deleted before state changes
 - failed and timed-out responses are handled
@@ -212,6 +214,20 @@ Callback invariants:
 - repeated callbacks cannot double pay
 - no admin drain path
 - payout recipient is fixed onchain to `0xeE59b12EB683A346b3D8A4CB43d5aFa8AD3303F3`
+
+### Somnia Agent Callback Compatibility
+
+One integration issue during the MVP was callback delivery from the live Somnia Agent platform. The contract cannot rely only on the typed `handleResponse` ABI path for live requests.
+
+Current requests pass this callback selector to `agentPlatform.createRequest`:
+
+```text
+0x12345678
+```
+
+`SomniBountyAI.fallback()` accepts that selector only from the configured Somnia Agent platform, decodes the raw callback payload, treats status word `2` as success, wraps the first returned bytes into a `Response`, deletes the pending request, and routes through the same internal state machine as `handleResponse`.
+
+Do not change live requests back to `handleResponse.selector` unless Somnia Agent docs and current testnet behavior are re-verified.
 
 ## Backend API
 
@@ -303,12 +319,26 @@ Agent platform: 0x037Bb9C718F3f7fe5eCBDB0b600D607b52706776
 Current deployed contracts:
 
 ```text
-VulnerabilityRegistry: 0x360A084BA109D10DF2a0538B602A8a5842db568b
-SomniBountyAI:         0x5a3a0376f28B9CB1aF5fFD23bBcFCdC71483FC59
+VulnerabilityRegistry: 0x7486949c6f8c6878EF03fc0E911f0Ed679Cc0CaD
+SomniBountyAI:         0xf920336C3e1A681dBbFBF690D334C60313ab9889
 Automation API:        https://p01--somnibountyai--yrnf5wlhj7v8.code.run
 ```
 
-Important: after the first deployment, the local smart contract env was corrected so future deployments use the documented fee split: LLM `0.07 STT` per validator and JSON API `0.03 STT` per validator. The contract source was also updated to enforce the fixed platform payout collector. Redeploy before a real full agent run.
+Deployment notes:
+
+- `VulnerabilityRegistry` was deployed directly, then seeded with 12 owner-only template transactions to avoid a large constructor gas wall on Somnia testnet.
+- `SomniBountyAI` was deployed directly against that seeded registry.
+- This deployment uses the documented fee split: LLM `0.07 STT` per validator and JSON API `0.03 STT` per validator.
+- This deployment enforces the fixed platform payout collector onchain.
+- This deployment emits request IDs for every automation stage: snapshot, LLM scan, second review, PR creation, and final review.
+
+Deployment transactions:
+
+```text
+Registry deploy: 0x01abad703bd92c92f123a2a97f64ace6a726fd269e6d159cf7fbc45bff15191a
+First seed tx:   0xd32d87c03c0e44b92352fe668573a173928c395e96d762bb1e0607464afb1737
+Escrow deploy:   0xe298b464881a6497c92051a3332d930467eeca73f9f5e09fc82fb319ecca610d
+```
 
 ## Local Setup
 
@@ -438,6 +468,15 @@ Set `NEXT_PUBLIC_*` values as both build arguments and runtime variables. Set se
   - Pull requests: read/write
   - Metadata: read-only
 - Rotate leaked or pasted secrets before public demos or production use.
+
+## Live Callback Troubleshooting
+
+If a live run appears stuck:
+
+- Before `snapshotURI`: check Somnia JSON API request status, callback delivery, and public `/api/repo/snapshot` availability.
+- After `snapshotURI`: inspect `LLMScanRequested`, `SecondReviewRequested`, `PRRequested`, and `FinalReviewRequested` events for emitted request IDs.
+- For any emitted request ID, read `pendingAgentRequests(requestId)`. Existing pending request means callback has not completed; missing pending request means callback completed or failed and state/log events should explain next stage.
+- Check `AgentLog` events first; the dashboard reads these logs for live timeline state.
 
 ## References
 
